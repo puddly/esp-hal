@@ -170,6 +170,12 @@ impl<'a> Ieee802154<'a> {
         ieee802154_receive();
     }
 
+    /// Replace the source-address match table (the addresses we have queued data for).
+    #[instability::unstable]
+    pub fn set_source_match_table(&mut self, short: &[u16], ext: &[u64]) {
+        raw::set_source_match_table(short, ext);
+    }
+
     /// Return the raw data of a received frame
     #[instability::unstable]
     pub fn raw_received(&mut self) -> Option<RawReceived> {

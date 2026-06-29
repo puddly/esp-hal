@@ -3,6 +3,8 @@ use alloc::collections::VecDeque as Queue;
 use esp_hal::{handler, interrupt::Priority, peripherals::IEEE802154};
 use esp_phy::{PhyClockGuard, PhyInitGuard};
 use esp_sync::NonReentrantMutex;
+use byte::TryRead;
+use ieee802154::mac::{Address, ExtendedAddress, Header, ShortAddress};
 
 use super::{
     frame::{
@@ -42,6 +44,9 @@ struct PendingTx {
 // valid for the lifetime of the pending operation (transmit_buffer in Ieee802154).
 unsafe impl Send for PendingTx {}
 
+/// Maximum source-match (frame-pending) table entries per address type.
+const SRC_MATCH_MAX: usize = 32;
+
 struct IeeeState {
     state: Ieee802154State,
     rx_queue: Queue<RawReceived>,
@@ -51,6 +56,11 @@ struct IeeeState {
     /// isr_handle_ack_rx_done and stop_rx_ack). Cleared at the start of
     /// each transmit.
     ack_frame: Option<RawReceived>,
+    /// Source-address match table: addresses we have queued data for.
+    src_match_short: [u16; SRC_MATCH_MAX],
+    src_match_short_len: usize,
+    src_match_ext: [u64; SRC_MATCH_MAX],
+    src_match_ext_len: usize,
 }
 
 static STATE: NonReentrantMutex<IeeeState> = NonReentrantMutex::new(IeeeState {
@@ -59,6 +69,10 @@ static STATE: NonReentrantMutex<IeeeState> = NonReentrantMutex::new(IeeeState {
     rx_queue_size: 10,
     pending_tx: None,
     ack_frame: None,
+    src_match_short: [0; SRC_MATCH_MAX],
+    src_match_short_len: 0,
+    src_match_ext: [0; SRC_MATCH_MAX],
+    src_match_ext_len: 0,
 });
 
 unsafe extern "C" {
@@ -425,6 +439,33 @@ pub fn set_pending_mode(mode: PendingMode) {
     ieee802154_pib_set_pending_mode(mode);
 }
 
+pub fn set_source_match_table(short: &[u16], ext: &[u64]) {
+    STATE.with(|state| {
+        let n = short.len().min(SRC_MATCH_MAX);
+        state.src_match_short[..n].copy_from_slice(&short[..n]);
+        state.src_match_short_len = n;
+
+        let m = ext.len().min(SRC_MATCH_MAX);
+        state.src_match_ext[..m].copy_from_slice(&ext[..m]);
+        state.src_match_ext_len = m;
+    });
+}
+
+fn src_addr_in_pending_table(state: &IeeeState, frm: &[u8]) -> bool {
+    let Ok((header, _)) = Header::try_read(frm, ()) else {
+        return false;
+    };
+    match header.source {
+        Some(Address::Short(_, ShortAddress(addr))) => {
+            state.src_match_short[..state.src_match_short_len].contains(&addr)
+        }
+        Some(Address::Extended(_, ExtendedAddress(addr))) => {
+            state.src_match_ext[..state.src_match_ext_len].contains(&addr)
+        }
+        None => false, // no source address present
+    }
+}
+
 #[allow(unused)]
 pub fn set_multipan_enable(mask: u8) {
     set_multipan_enable_mask(mask);
@@ -615,6 +656,7 @@ fn isr_handle_rx_done(needs_next_op: &mut bool) {
                 // auto tx ack for frame version 0b00 and 0b01
                 // Frame data already copied above. Defer rx_available()
                 // notification until ACK completes (isr_handle_ack_tx_done).
+                set_pending_bit(src_addr_in_pending_table(state, frm));
                 state.state = Ieee802154State::TxAck;
                 *needs_next_op = false;
             } else if should_send_enhanced_ack(frm) {
