@@ -542,7 +542,12 @@ pub mod dma {
         }
 
         fn reset_aes(&self) {
-            PeripheralClockControl::reset(Peripheral::Aes);
+            // A DMA-AES `process` can run while that lock is already held elsewhere on
+            // the call stack. A plain critical section gives the same atomicity for
+            // the shared-reset-register write without the non-reentrant guard.
+            critical_section::with(|_| unsafe {
+                PeripheralClockControl::reset_racey(Peripheral::Aes);
+            });
         }
 
         fn enable_dma(&self, enable: bool) {
